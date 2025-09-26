@@ -181,7 +181,7 @@ async function processItem(jellyfinItem, libraryId, metrics) {
         rawData: jellyfinItem, // Store complete BaseItemDto
         updatedAt: new Date(),
     };
-    // Upsert item
+    // Standard upsert for all cases
     await database_1.db
         .insert(database_1.items)
         .values(itemData)

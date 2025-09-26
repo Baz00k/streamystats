@@ -284,7 +284,7 @@ async function processItem(
     updatedAt: new Date(),
   };
 
-  // Upsert item
+  // Standard upsert for all cases
   await db
     .insert(items)
     .values(itemData)
