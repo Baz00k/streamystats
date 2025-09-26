@@ -105,7 +105,72 @@ async function syncLibraryItems(libraryId, client, metrics, options) {
         }
     }
 }
+/**
+ * Find potential duplicate item that could be the same content with a different ID
+ * This helps handle the case where Jellyfin removes and re-adds items with new IDs
+ */
+async function findPotentialDuplicate(jellyfinItem, libraryId, serverId) {
+    // Don't look for duplicates if we don't have good identifying information
+    if (!jellyfinItem.Name) {
+        return null;
+    }
+    // Build potential duplicate queries based on item type and available metadata
+    const duplicateCandidates = [];
+    // Strategy 1: Match by file path (most reliable)
+    if (jellyfinItem.Path) {
+        duplicateCandidates.push(database_1.db
+            .select()
+            .from(database_1.items)
+            .where((0, drizzle_orm_1.and)((0, drizzle_orm_1.eq)(database_1.items.serverId, serverId), (0, drizzle_orm_1.eq)(database_1.items.libraryId, libraryId), (0, drizzle_orm_1.eq)(database_1.items.path, jellyfinItem.Path)))
+            .limit(1));
+    }
+    // Strategy 2: Match episodes by series + season + episode number
+    if (jellyfinItem.Type === "Episode" &&
+        jellyfinItem.SeriesName &&
+        jellyfinItem.IndexNumber !== null &&
+        jellyfinItem.IndexNumber !== undefined) {
+        duplicateCandidates.push(database_1.db
+            .select()
+            .from(database_1.items)
+            .where((0, drizzle_orm_1.and)((0, drizzle_orm_1.eq)(database_1.items.serverId, serverId), (0, drizzle_orm_1.eq)(database_1.items.libraryId, libraryId), (0, drizzle_orm_1.eq)(database_1.items.type, "Episode"), (0, drizzle_orm_1.eq)(database_1.items.seriesName, jellyfinItem.SeriesName), (0, drizzle_orm_1.eq)(database_1.items.indexNumber, jellyfinItem.IndexNumber), (0, drizzle_orm_1.eq)(database_1.items.parentIndexNumber, jellyfinItem.ParentIndexNumber ?? 1)))
+            .limit(1));
+    }
+    // Strategy 3: Match movies by name + year + runtime
+    if (jellyfinItem.Type === "Movie") {
+        duplicateCandidates.push(database_1.db
+            .select()
+            .from(database_1.items)
+            .where((0, drizzle_orm_1.and)((0, drizzle_orm_1.eq)(database_1.items.serverId, serverId), (0, drizzle_orm_1.eq)(database_1.items.libraryId, libraryId), (0, drizzle_orm_1.eq)(database_1.items.type, "Movie"), (0, drizzle_orm_1.eq)(database_1.items.name, jellyfinItem.Name), jellyfinItem.ProductionYear
+            ? (0, drizzle_orm_1.eq)(database_1.items.productionYear, jellyfinItem.ProductionYear)
+            : undefined, jellyfinItem.RunTimeTicks
+            ? (0, drizzle_orm_1.eq)(database_1.items.runtimeTicks, jellyfinItem.RunTimeTicks)
+            : undefined))
+            .limit(1));
+    }
+    // Strategy 4: Match by name + type for other content
+    duplicateCandidates.push(database_1.db
+        .select()
+        .from(database_1.items)
+        .where((0, drizzle_orm_1.and)((0, drizzle_orm_1.eq)(database_1.items.serverId, serverId), (0, drizzle_orm_1.eq)(database_1.items.libraryId, libraryId), (0, drizzle_orm_1.eq)(database_1.items.name, jellyfinItem.Name), (0, drizzle_orm_1.eq)(database_1.items.type, jellyfinItem.Type || "Unknown")))
+        .limit(1));
+    // Execute all queries and return the first match found
+    for (const candidateQuery of duplicateCandidates) {
+        try {
+            const candidates = await candidateQuery;
+            if (candidates.length > 0) {
+                console.log(`Found potential duplicate for ${jellyfinItem.Type} "${jellyfinItem.Name}": ` +
+                    `existing ID ${candidates[0].id} -> new ID ${jellyfinItem.Id}`);
+                return candidates[0];
+            }
+        }
+        catch (error) {
+            console.error("Error checking for duplicate items:", error);
+        }
+    }
+    return null;
+}
 async function processItem(jellyfinItem, libraryId, metrics) {
+    const serverId = await getServerIdFromLibrary(libraryId);
     // Check if item already exists and compare etag for changes
     const existingItem = await database_1.db
         .select({ etag: database_1.items.etag })
@@ -114,6 +179,11 @@ async function processItem(jellyfinItem, libraryId, metrics) {
         .limit(1);
     const isNewItem = existingItem.length === 0;
     const hasChanged = !isNewItem && existingItem[0].etag !== jellyfinItem.Etag;
+    // If this is a "new" item, check for potential duplicates
+    let duplicateItem = null;
+    if (isNewItem) {
+        duplicateItem = await findPotentialDuplicate(jellyfinItem, libraryId, serverId);
+    }
     if (!isNewItem && !hasChanged) {
         metrics.incrementItemsUnchanged();
         metrics.incrementItemsProcessed();
@@ -121,7 +191,7 @@ async function processItem(jellyfinItem, libraryId, metrics) {
     }
     const itemData = {
         id: jellyfinItem.Id,
-        serverId: await getServerIdFromLibrary(libraryId),
+        serverId,
         libraryId,
         name: jellyfinItem.Name,
         type: jellyfinItem.Type,
@@ -181,24 +251,67 @@ async function processItem(jellyfinItem, libraryId, metrics) {
         rawData: jellyfinItem, // Store complete BaseItemDto
         updatedAt: new Date(),
     };
-    // Upsert item
-    await database_1.db
-        .insert(database_1.items)
-        .values(itemData)
-        .onConflictDoUpdate({
-        target: database_1.items.id,
-        set: {
-            ...itemData,
-            updatedAt: new Date(),
-        },
-    });
-    metrics.incrementDatabaseOperations();
-    if (isNewItem) {
-        metrics.incrementItemsInserted();
+    // Handle duplicate item scenario - same content but different ID
+    if (duplicateItem) {
+        console.log(`Migrating duplicate item: ${duplicateItem.id} -> ${jellyfinItem.Id} ` +
+            `for "${jellyfinItem.Name}" (${jellyfinItem.Type})`);
+        try {
+            // Use a transaction to ensure data consistency
+            await database_1.db.transaction(async (tx) => {
+                // 1. Update any sessions that reference the old item ID to use the new ID
+                await tx
+                    .update(database_1.sessions)
+                    .set({ itemId: jellyfinItem.Id })
+                    .where((0, drizzle_orm_1.eq)(database_1.sessions.itemId, duplicateItem.id));
+                // 2. Delete the old item record
+                await tx.delete(database_1.items).where((0, drizzle_orm_1.eq)(database_1.items.id, duplicateItem.id));
+                // 3. Insert the new item record with the new ID and updated data
+                await tx.insert(database_1.items).values(itemData);
+            });
+            console.log(`Successfully migrated item and updated session references: ${duplicateItem.id} -> ${jellyfinItem.Id}`);
+            metrics.incrementItemsUpdated(); // Count as update since we're replacing existing data
+        }
+        catch (error) {
+            console.error(`Failed to migrate duplicate item ${duplicateItem.id} -> ${jellyfinItem.Id}:`, error);
+            // Fall back to standard upsert if migration fails
+            await database_1.db
+                .insert(database_1.items)
+                .values(itemData)
+                .onConflictDoUpdate({
+                target: database_1.items.id,
+                set: {
+                    ...itemData,
+                    updatedAt: new Date(),
+                },
+            });
+            if (isNewItem) {
+                metrics.incrementItemsInserted();
+            }
+            else {
+                metrics.incrementItemsUpdated();
+            }
+        }
     }
     else {
-        metrics.incrementItemsUpdated();
+        // Standard upsert for normal cases
+        await database_1.db
+            .insert(database_1.items)
+            .values(itemData)
+            .onConflictDoUpdate({
+            target: database_1.items.id,
+            set: {
+                ...itemData,
+                updatedAt: new Date(),
+            },
+        });
+        if (isNewItem) {
+            metrics.incrementItemsInserted();
+        }
+        else {
+            metrics.incrementItemsUpdated();
+        }
     }
+    metrics.incrementDatabaseOperations();
     metrics.incrementItemsProcessed();
 }
 // Cache for server ID lookups

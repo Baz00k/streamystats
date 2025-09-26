@@ -1,8 +1,9 @@
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, or } from "drizzle-orm";
 import {
   db,
   items,
   libraries,
+  sessions,
   Server,
   NewItem,
   Library,
@@ -200,11 +201,134 @@ async function syncLibraryItems(
   }
 }
 
+/**
+ * Find potential duplicate item that could be the same content with a different ID
+ * This helps handle the case where Jellyfin removes and re-adds items with new IDs
+ */
+async function findPotentialDuplicate(
+  jellyfinItem: JellyfinBaseItemDto,
+  libraryId: string,
+  serverId: number
+): Promise<Item | null> {
+  // Don't look for duplicates if we don't have good identifying information
+  if (!jellyfinItem.Name) {
+    return null;
+  }
+
+  // Build potential duplicate queries based on item type and available metadata
+  const duplicateCandidates: Promise<Item[]>[] = [];
+
+  // Strategy 1: Match by file path (most reliable)
+  if (jellyfinItem.Path) {
+    duplicateCandidates.push(
+      db
+        .select()
+        .from(items)
+        .where(
+          and(
+            eq(items.serverId, serverId),
+            eq(items.libraryId, libraryId),
+            eq(items.path, jellyfinItem.Path)
+          )
+        )
+        .limit(1)
+    );
+  }
+
+  // Strategy 2: Match episodes by series + season + episode number
+  if (
+    jellyfinItem.Type === "Episode" &&
+    jellyfinItem.SeriesName &&
+    jellyfinItem.IndexNumber !== null &&
+    jellyfinItem.IndexNumber !== undefined
+  ) {
+    duplicateCandidates.push(
+      db
+        .select()
+        .from(items)
+        .where(
+          and(
+            eq(items.serverId, serverId),
+            eq(items.libraryId, libraryId),
+            eq(items.type, "Episode"),
+            eq(items.seriesName, jellyfinItem.SeriesName),
+            eq(items.indexNumber, jellyfinItem.IndexNumber),
+            eq(
+              items.parentIndexNumber,
+              jellyfinItem.ParentIndexNumber ?? 1
+            )
+          )
+        )
+        .limit(1)
+    );
+  }
+
+  // Strategy 3: Match movies by name + year + runtime
+  if (jellyfinItem.Type === "Movie") {
+    duplicateCandidates.push(
+      db
+        .select()
+        .from(items)
+        .where(
+          and(
+            eq(items.serverId, serverId),
+            eq(items.libraryId, libraryId),
+            eq(items.type, "Movie"),
+            eq(items.name, jellyfinItem.Name),
+            jellyfinItem.ProductionYear
+              ? eq(items.productionYear, jellyfinItem.ProductionYear)
+              : undefined,
+            jellyfinItem.RunTimeTicks
+              ? eq(items.runtimeTicks, jellyfinItem.RunTimeTicks)
+              : undefined
+          )
+        )
+        .limit(1)
+    );
+  }
+
+  // Strategy 4: Match by name + type for other content
+  duplicateCandidates.push(
+    db
+      .select()
+      .from(items)
+      .where(
+        and(
+          eq(items.serverId, serverId),
+          eq(items.libraryId, libraryId),
+          eq(items.name, jellyfinItem.Name),
+          eq(items.type, jellyfinItem.Type || "Unknown")
+        )
+      )
+      .limit(1)
+  );
+
+  // Execute all queries and return the first match found
+  for (const candidateQuery of duplicateCandidates) {
+    try {
+      const candidates = await candidateQuery;
+      if (candidates.length > 0) {
+        console.log(
+          `Found potential duplicate for ${jellyfinItem.Type} "${jellyfinItem.Name}": ` +
+          `existing ID ${candidates[0].id} -> new ID ${jellyfinItem.Id}`
+        );
+        return candidates[0];
+      }
+    } catch (error) {
+      console.error("Error checking for duplicate items:", error);
+    }
+  }
+
+  return null;
+}
+
 async function processItem(
   jellyfinItem: JellyfinBaseItemDto,
   libraryId: string,
   metrics: SyncMetricsTracker
 ): Promise<void> {
+  const serverId = await getServerIdFromLibrary(libraryId);
+
   // Check if item already exists and compare etag for changes
   const existingItem = await db
     .select({ etag: items.etag })
@@ -215,6 +339,12 @@ async function processItem(
   const isNewItem = existingItem.length === 0;
   const hasChanged = !isNewItem && existingItem[0].etag !== jellyfinItem.Etag;
 
+  // If this is a "new" item, check for potential duplicates
+  let duplicateItem: Item | null = null;
+  if (isNewItem) {
+    duplicateItem = await findPotentialDuplicate(jellyfinItem, libraryId, serverId);
+  }
+
   if (!isNewItem && !hasChanged) {
     metrics.incrementItemsUnchanged();
     metrics.incrementItemsProcessed();
@@ -223,7 +353,7 @@ async function processItem(
 
   const itemData: NewItem = {
     id: jellyfinItem.Id,
-    serverId: await getServerIdFromLibrary(libraryId),
+    serverId,
     libraryId,
     name: jellyfinItem.Name,
     type: jellyfinItem.Type,
@@ -284,26 +414,79 @@ async function processItem(
     updatedAt: new Date(),
   };
 
-  // Upsert item
-  await db
-    .insert(items)
-    .values(itemData)
-    .onConflictDoUpdate({
-      target: items.id,
-      set: {
-        ...itemData,
-        updatedAt: new Date(),
-      },
-    });
+  // Handle duplicate item scenario - same content but different ID
+  if (duplicateItem) {
+    console.log(
+      `Migrating duplicate item: ${duplicateItem.id} -> ${jellyfinItem.Id} ` +
+      `for "${jellyfinItem.Name}" (${jellyfinItem.Type})`
+    );
 
-  metrics.incrementDatabaseOperations();
+    try {
+      // Use a transaction to ensure data consistency
+      await db.transaction(async (tx) => {
+        // 1. Update any sessions that reference the old item ID to use the new ID
+        await tx
+          .update(sessions)
+          .set({ itemId: jellyfinItem.Id })
+          .where(eq(sessions.itemId, duplicateItem.id));
 
-  if (isNewItem) {
-    metrics.incrementItemsInserted();
+        // 2. Delete the old item record
+        await tx.delete(items).where(eq(items.id, duplicateItem.id));
+
+        // 3. Insert the new item record with the new ID and updated data
+        await tx.insert(items).values(itemData);
+      });
+
+      console.log(
+        `Successfully migrated item and updated session references: ${duplicateItem.id} -> ${jellyfinItem.Id}`
+      );
+
+      metrics.incrementItemsUpdated(); // Count as update since we're replacing existing data
+    } catch (error) {
+      console.error(
+        `Failed to migrate duplicate item ${duplicateItem.id} -> ${jellyfinItem.Id}:`,
+        error
+      );
+      
+      // Fall back to standard upsert if migration fails
+      await db
+        .insert(items)
+        .values(itemData)
+        .onConflictDoUpdate({
+          target: items.id,
+          set: {
+            ...itemData,
+            updatedAt: new Date(),
+          },
+        });
+
+      if (isNewItem) {
+        metrics.incrementItemsInserted();
+      } else {
+        metrics.incrementItemsUpdated();
+      }
+    }
   } else {
-    metrics.incrementItemsUpdated();
+    // Standard upsert for normal cases
+    await db
+      .insert(items)
+      .values(itemData)
+      .onConflictDoUpdate({
+        target: items.id,
+        set: {
+          ...itemData,
+          updatedAt: new Date(),
+        },
+      });
+
+    if (isNewItem) {
+      metrics.incrementItemsInserted();
+    } else {
+      metrics.incrementItemsUpdated();
+    }
   }
 
+  metrics.incrementDatabaseOperations();
   metrics.incrementItemsProcessed();
 }
 
