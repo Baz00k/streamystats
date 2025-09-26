@@ -3,6 +3,7 @@ import {
   servers,
   sessions,
   users,
+  items,
   NewSession,
 } from "@streamystats/database";
 import { JellyfinClient } from "../jellyfin/client";
@@ -549,11 +550,40 @@ class SessionPoller {
         .where(eq(users.id, tracked.userJellyfinId))
         .limit(1);
 
+      // Validate item exists in database and handle missing references
+      let finalItemId: string | null = tracked.itemId;
+      if (tracked.itemId) {
+        try {
+          const existingItem = await db
+            .select({ id: items.id })
+            .from(items)
+            .where(eq(items.id, tracked.itemId))
+            .limit(1);
+
+          if (existingItem.length === 0) {
+            console.warn("Item reference not found, setting to null:", {
+              missingItemId: tracked.itemId,
+              itemName: tracked.itemName,
+              serverId: server.id,
+              sessionKey: tracked.sessionKey,
+            });
+            finalItemId = null; // Set to null instead of failing
+          }
+        } catch (error) {
+          console.error("Error checking itemId existence:", {
+            itemId: tracked.itemId,
+            serverId: server.id,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          finalItemId = null; // Set to null on error
+        }
+      }
+
       const playbackRecord: NewSession = {
         id: uuidv4(),
         serverId: server.id,
         userId: user.length > 0 ? user[0].id : null,
-        itemId: tracked.itemId,
+        itemId: finalItemId,
         userName: tracked.userName,
         userServerId: tracked.userJellyfinId,
         deviceId: tracked.deviceId,
