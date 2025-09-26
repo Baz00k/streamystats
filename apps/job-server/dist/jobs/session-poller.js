@@ -366,40 +366,11 @@ class SessionPoller {
                 .from(database_1.users)
                 .where((0, drizzle_orm_1.eq)(database_1.users.id, tracked.userJellyfinId))
                 .limit(1);
-            // Check if itemId exists in items table to avoid foreign key constraint violation
-            let finalItemId = tracked.itemId;
-            if (tracked.itemId) {
-                try {
-                    const existingItem = await database_1.db
-                        .select({ id: database_1.items.id })
-                        .from(database_1.items)
-                        .where((0, drizzle_orm_1.eq)(database_1.items.id, tracked.itemId))
-                        .limit(1);
-                    if (existingItem.length === 0) {
-                        console.warn("Item reference not found, setting to null:", {
-                            missingItemId: tracked.itemId,
-                            itemName: tracked.itemName,
-                            serverName: server.name,
-                            userName: tracked.userName,
-                        });
-                        finalItemId = null; // Set to null instead of failing
-                    }
-                }
-                catch (error) {
-                    console.error("Error checking itemId existence:", {
-                        itemId: tracked.itemId,
-                        itemName: tracked.itemName,
-                        serverName: server.name,
-                        error: error instanceof Error ? error.message : "Unknown error",
-                    });
-                    finalItemId = null; // Set to null on error
-                }
-            }
             const playbackRecord = {
                 id: (0, uuid_1.v4)(),
                 serverId: server.id,
                 userId: user.length > 0 ? user[0].id : null,
-                itemId: finalItemId,
+                itemId: tracked.itemId,
                 userName: tracked.userName,
                 userServerId: tracked.userJellyfinId,
                 deviceId: tracked.deviceId,
